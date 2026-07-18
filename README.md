@@ -64,12 +64,11 @@ Local execution uses long polling. Cloud Run uses an HTTPS webhook.
 
 ## Deploy to Google Cloud Run
 
-The commands below use us-east1; choose a Firestore and Cloud Run region appropriate for you.
-Set these shell variables first:
+The deployment is configured for project gym-trainer-502823 in us-east4:
 
 ~~~bash
-PROJECT_ID=your-project-id
-REGION=us-east1
+PROJECT_ID=gym-trainer-502823
+REGION=us-east4
 SERVICE=gym-trainer
 SERVICE_ACCOUNT=gym-trainer-runner
 ~~~
