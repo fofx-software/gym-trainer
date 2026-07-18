@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
-
 from dotenv import load_dotenv
 
 
@@ -13,7 +11,11 @@ class Settings:
     openai_api_key: str
     allowed_user_id: int | None
     model: str
-    database_path: Path
+    google_cloud_project: str | None
+    firestore_database: str
+    webhook_url: str | None
+    webhook_secret: str | None
+    port: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -30,5 +32,9 @@ class Settings:
             openai_api_key=openai_api_key,
             allowed_user_id=int(raw_user_id) if raw_user_id else None,
             model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
-            database_path=Path(os.getenv("DATABASE_PATH", "data/gym_agent.db")),
+            google_cloud_project=os.getenv("GOOGLE_CLOUD_PROJECT") or None,
+            firestore_database=os.getenv("FIRESTORE_DATABASE", "(default)"),
+            webhook_url=os.getenv("WEBHOOK_URL") or None,
+            webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET") or None,
+            port=int(os.getenv("PORT", "8080")),
         )
