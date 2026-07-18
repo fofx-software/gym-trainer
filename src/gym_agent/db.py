@@ -1,232 +1,160 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-import sqlite3
-from typing import Iterator
+import hashlib
+from typing import Any
+
+from google.cloud import firestore
 
 
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-CREATE TABLE IF NOT EXISTS profiles (
-    telegram_user_id INTEGER PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    goals TEXT NOT NULL DEFAULT '',
-    experience TEXT NOT NULL DEFAULT '',
-    schedule TEXT NOT NULL DEFAULT '',
-    equipment TEXT NOT NULL DEFAULT '',
-    limitations TEXT NOT NULL DEFAULT '',
-    units TEXT NOT NULL DEFAULT 'lb',
-    updated_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS workouts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_user_id INTEGER NOT NULL,
-    performed_at TEXT NOT NULL,
-    notes TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS sets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    workout_id INTEGER NOT NULL REFERENCES workouts(id) ON DELETE CASCADE,
-    exercise TEXT NOT NULL COLLATE NOCASE,
-    weight REAL NOT NULL CHECK(weight >= 0),
-    reps INTEGER NOT NULL CHECK(reps > 0),
-    rpe REAL CHECK(rpe IS NULL OR (rpe >= 1 AND rpe <= 10))
-);
-
-CREATE INDEX IF NOT EXISTS idx_workouts_user_date
-ON workouts(telegram_user_id, performed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sets_exercise ON sets(exercise);
-
-CREATE TABLE IF NOT EXISTS exercise_feedback (
-    telegram_user_id INTEGER NOT NULL,
-    exercise TEXT NOT NULL COLLATE NOCASE,
-    adjustment TEXT NOT NULL CHECK(adjustment IN ('increase', 'same', 'decrease')),
-    note TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (telegram_user_id, exercise)
-);
-
-CREATE TABLE IF NOT EXISTS workout_plans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_user_id INTEGER NOT NULL,
-    created_at TEXT NOT NULL,
-    plan TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_plans_user_date
-ON workout_plans(telegram_user_id, created_at DESC);
-"""
+def _feedback_id(exercise: str) -> str:
+    return hashlib.sha256(exercise.strip().casefold().encode()).hexdigest()
 
 
 class Database:
-    def __init__(self, path: Path):
-        self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as connection:
-            connection.executescript(SCHEMA)
+    """Firestore persistence for athlete profiles, training, feedback, and plans."""
 
-    @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        try:
-            yield connection
-            connection.commit()
-        finally:
-            connection.close()
+    def __init__(
+        self,
+        project: str | None = None,
+        database: str = "(default)",
+        client: Any | None = None,
+    ):
+        self.client = client or firestore.Client(project=project, database=database)
+
+    def _user(self, user_id: int) -> Any:
+        return self.client.collection("users").document(str(user_id))
 
     def upsert_profile(self, user_id: int, display_name: str, fields: dict[str, str]) -> None:
         allowed = {"goals", "experience", "schedule", "equipment", "limitations", "units"}
         clean = {key: value.strip() for key, value in fields.items() if key in allowed}
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connect() as connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO profiles (telegram_user_id, display_name, updated_at) "
-                "VALUES (?, ?, ?)",
-                (user_id, display_name, now),
-            )
-            assignments = ["display_name = ?", "updated_at = ?"]
-            values: list[object] = [display_name, now]
-            for key, value in clean.items():
-                assignments.append(f"{key} = ?")
-                values.append(value)
-            values.append(user_id)
-            connection.execute(
-                f"UPDATE profiles SET {', '.join(assignments)} WHERE telegram_user_id = ?",
-                values,
-            )
+        clean.update({"display_name": display_name, "updated_at": _now()})
+        self._user(user_id).set(clean, merge=True)
 
     def profile(self, user_id: int) -> dict[str, object] | None:
-        with self.connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM profiles WHERE telegram_user_id = ?", (user_id,)
-            ).fetchone()
-        return dict(row) if row else None
+        snapshot = self._user(user_id).get()
+        return snapshot.to_dict() if snapshot.exists else None
 
-    def log_sets(self, user_id: int, sets: list[dict[str, object]], notes: str = "") -> int:
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connect() as connection:
-            cursor = connection.execute(
-                "INSERT INTO workouts (telegram_user_id, performed_at, notes) VALUES (?, ?, ?)",
-                (user_id, now, notes),
+    def log_sets(self, user_id: int, sets: list[dict[str, object]], notes: str = "") -> str:
+        user = self._user(user_id)
+        workout = user.collection("workouts").document()
+        performed_at = _now()
+        batch = self.client.batch()
+        batch.set(workout, {"performed_at": performed_at, "notes": notes})
+        for item in sets:
+            set_ref = user.collection("sets").document()
+            batch.set(
+                set_ref,
+                {
+                    "workout_id": workout.id,
+                    "performed_at": performed_at,
+                    "exercise": item["exercise"],
+                    "weight": float(item["weight"]),
+                    "reps": int(item["reps"]),
+                    "rpe": item.get("rpe"),
+                },
             )
-            workout_id = int(cursor.lastrowid)
-            connection.executemany(
-                "INSERT INTO sets (workout_id, exercise, weight, reps, rpe) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [
-                    (workout_id, s["exercise"], s["weight"], s["reps"], s.get("rpe"))
-                    for s in sets
-                ],
-            )
-        return workout_id
+        batch.commit()
+        return workout.id
 
     def recent_sets(self, user_id: int, limit: int = 40) -> list[dict[str, object]]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """SELECT w.performed_at, s.exercise, s.weight, s.reps, s.rpe
-                   FROM sets s JOIN workouts w ON w.id = s.workout_id
-                   WHERE w.telegram_user_id = ?
-                   ORDER BY w.performed_at DESC, s.id DESC LIMIT ?""",
-                (user_id, limit),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        query = (
+            self._user(user_id)
+            .collection("sets")
+            .order_by("performed_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+        return [snapshot.to_dict() for snapshot in query.stream()]
 
     def personal_records(self, user_id: int) -> list[dict[str, object]]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """SELECT s.exercise, MAX(s.weight) AS max_weight,
-                          MAX(s.weight * (1.0 + s.reps / 30.0)) AS estimated_1rm
-                   FROM sets s JOIN workouts w ON w.id = s.workout_id
-                   WHERE w.telegram_user_id = ? GROUP BY lower(s.exercise)
-                   ORDER BY exercise""",
-                (user_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        records: dict[str, dict[str, object]] = {}
+        for snapshot in self._user(user_id).collection("sets").stream():
+            item = snapshot.to_dict()
+            key = str(item["exercise"]).casefold()
+            estimate = float(item["weight"]) * (1.0 + int(item["reps"]) / 30.0)
+            record = records.setdefault(
+                key,
+                {
+                    "exercise": item["exercise"],
+                    "max_weight": float(item["weight"]),
+                    "estimated_1rm": estimate,
+                },
+            )
+            record["max_weight"] = max(float(record["max_weight"]), float(item["weight"]))
+            record["estimated_1rm"] = max(float(record["estimated_1rm"]), estimate)
+        return sorted(records.values(), key=lambda item: str(item["exercise"]).casefold())
 
     def save_feedback(
         self, user_id: int, exercise: str, adjustment: str, note: str = ""
     ) -> None:
         if adjustment not in {"increase", "same", "decrease"}:
             raise ValueError("Adjustment must be increase, same, or decrease")
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connect() as connection:
-            connection.execute(
-                """INSERT INTO exercise_feedback
-                   (telegram_user_id, exercise, adjustment, note, updated_at)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(telegram_user_id, exercise) DO UPDATE SET
-                     adjustment = excluded.adjustment, note = excluded.note,
-                     updated_at = excluded.updated_at""",
-                (user_id, exercise.strip().title(), adjustment, note.strip(), now),
-            )
+        normalized = exercise.strip().title()
+        self._user(user_id).collection("feedback").document(_feedback_id(normalized)).set(
+            {
+                "exercise": normalized,
+                "adjustment": adjustment,
+                "note": note.strip(),
+                "updated_at": _now(),
+            }
+        )
 
     def feedback(self, user_id: int) -> list[dict[str, object]]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """SELECT exercise, adjustment, note, updated_at
-                   FROM exercise_feedback WHERE telegram_user_id = ?
-                   ORDER BY updated_at DESC""",
-                (user_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        query = self._user(user_id).collection("feedback").order_by(
+            "updated_at", direction=firestore.Query.DESCENDING
+        )
+        return [snapshot.to_dict() for snapshot in query.stream()]
 
     def weight_suggestions(self, user_id: int) -> list[dict[str, object]]:
-        """Suggest the next load from the latest set and saved athlete feedback."""
         profile = self.profile(user_id) or {}
         units = str(profile.get("units", "lb")).lower()
         default_step = 2.5 if units in {"kg", "kgs", "kilograms"} else 5.0
-        with self.connect() as connection:
-            rows = connection.execute(
-                """WITH ranked AS (
-                       SELECT s.exercise, s.weight, s.reps, s.rpe,
-                              ROW_NUMBER() OVER (
-                                  PARTITION BY lower(s.exercise)
-                                  ORDER BY w.performed_at DESC, s.id DESC
-                              ) AS position
-                       FROM sets s JOIN workouts w ON w.id = s.workout_id
-                       WHERE w.telegram_user_id = ?
-                   )
-                   SELECT r.exercise, r.weight, r.reps, r.rpe,
-                          f.adjustment, f.note
-                   FROM ranked r
-                   LEFT JOIN exercise_feedback f
-                     ON f.telegram_user_id = ? AND f.exercise = r.exercise
-                   WHERE r.position = 1 ORDER BY r.exercise""",
-                (user_id, user_id),
-            ).fetchall()
+        feedback = {
+            str(item["exercise"]).casefold(): item for item in self.feedback(user_id)
+        }
+        latest: dict[str, dict[str, object]] = {}
+        for item in self.recent_sets(user_id, limit=500):
+            key = str(item["exercise"]).casefold()
+            latest.setdefault(key, item)
+
         suggestions = []
-        for row in rows:
-            item = dict(row)
-            adjustment = item.get("adjustment")
+        for key, source in latest.items():
+            item = dict(source)
+            saved = feedback.get(key, {})
+            adjustment = saved.get("adjustment")
             delta = default_step if adjustment == "increase" else 0.0
             if adjustment == "decrease":
                 delta = -default_step
-            item["suggested_weight"] = max(0.0, float(item["weight"]) + delta)
-            item["units"] = units
-            suggestions.append(item)
-        return suggestions
-
-    def save_plan(self, user_id: int, plan: str) -> int:
-        now = datetime.now(timezone.utc).isoformat()
-        with self.connect() as connection:
-            cursor = connection.execute(
-                "INSERT INTO workout_plans (telegram_user_id, created_at, plan) VALUES (?, ?, ?)",
-                (user_id, now, plan),
+            item.update(
+                {
+                    "adjustment": adjustment,
+                    "note": saved.get("note", ""),
+                    "suggested_weight": max(0.0, float(item["weight"]) + delta),
+                    "units": units,
+                }
             )
-        return int(cursor.lastrowid)
+            suggestions.append(item)
+        return sorted(suggestions, key=lambda item: str(item["exercise"]).casefold())
+
+    def save_plan(self, user_id: int, plan: str) -> str:
+        reference = self._user(user_id).collection("plans").document()
+        reference.set({"created_at": _now(), "plan": plan})
+        return reference.id
 
     def latest_plan(self, user_id: int) -> dict[str, object] | None:
-        with self.connect() as connection:
-            row = connection.execute(
-                """SELECT id, created_at, plan FROM workout_plans
-                   WHERE telegram_user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1""",
-                (user_id,),
-            ).fetchone()
-        return dict(row) if row else None
+        query = (
+            self._user(user_id)
+            .collection("plans")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(1)
+        )
+        snapshots = list(query.stream())
+        if not snapshots:
+            return None
+        result = snapshots[0].to_dict()
+        result["id"] = snapshots[0].id
+        return result

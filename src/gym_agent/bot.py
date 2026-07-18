@@ -33,7 +33,10 @@ Or just message me: “My shoulder feels odd on incline press” or “What shou
 class GymBot:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.database = Database(settings.database_path)
+        self.database = Database(
+            project=settings.google_cloud_project,
+            database=settings.firestore_database,
+        )
         self.coach = Coach(settings.openai_api_key, settings.model, self.database)
 
     def allowed(self, update: Update) -> bool:
