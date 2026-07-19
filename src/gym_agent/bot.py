@@ -15,6 +15,8 @@ from .parsing import parse_feedback, parse_profile, parse_sets
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+# HTTPX request URLs for the Telegram API contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 HELP = """<b>Gym Agent</b>
 
